@@ -271,6 +271,50 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                             len(agent._codex_streamed_text_parts), len(assembled),
                         )
                 return final_response
+        except TypeError as exc:
+            # OpenAI SDK 2.24.0 can crash while parsing the terminal
+            # response.completed frame from chatgpt.com/backend-api/codex when
+            # that frame has output=null. The useful answer has already arrived
+            # in response.output_item.done / output_text.delta events, so return
+            # a minimal response object from the collected stream state.
+            if "'NoneType' object is not iterable" not in str(exc):
+                raise
+            if collected_output_items:
+                logger.warning(
+                    "Codex Responses stream terminal parse failed with output=null; "
+                    "recovering from %d collected output item(s). %s",
+                    len(collected_output_items),
+                    agent._client_log_context(),
+                )
+                return SimpleNamespace(
+                    status="completed",
+                    output=list(collected_output_items),
+                    output_text="".join(agent._codex_streamed_text_parts),
+                )
+            if agent._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(agent._codex_streamed_text_parts)
+                logger.warning(
+                    "Codex Responses stream terminal parse failed with output=null; "
+                    "recovering from %d streamed text delta(s). %s",
+                    len(agent._codex_streamed_text_parts),
+                    agent._client_log_context(),
+                )
+                return SimpleNamespace(
+                    status="completed",
+                    output=[SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                    output_text=assembled,
+                )
+            logger.warning(
+                "Codex Responses stream terminal parse failed with output=null "
+                "before yielding recoverable output; falling back to create(stream=True). %s",
+                agent._client_log_context(),
+            )
+            return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
                 logger.debug(
