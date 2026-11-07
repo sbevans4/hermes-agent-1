@@ -82,9 +82,68 @@ def _env_ref_name(ref: str) -> str:
     return ref
 
 
+# Scheme runs and authority spans are scanned monotonically, never retried at
+# each possible scheme starting letter. No length cap or URL-parser exceptions.
+_SCHEME_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-")
+_ASCII_LETTERS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+
+
+def _strip_url_userinfo(text: str) -> str:
+    """Strip through the last literal @ in scheme-prefixed authorities.
+
+    Authority ends at whitespace, /, ?, #, <, > or double quote. Apostrophe
+    and all RFC 3986 sub-delimiters remain valid userinfo characters. This is
+    conservative text sanitization, not URL validation: repeated @, invalid
+    percent escapes, Unicode and malformed IPv6 are accepted without parsing.
+    Email, protocol-relative URLs, encoded schemes and path/query/fragment @
+    are outside this additional rule (legacy credential matching still runs).
+    """
+    if not isinstance(text, str):
+        raise TypeError("error text must be str")
+    chunks = []
+    cursor = copied = 0
+    length = len(text)
+    while True:
+        marker = text.find("://", cursor)
+        if marker < 0:
+            break
+        # Slash in the previous marker bounds this backward walk. Its span
+        # cannot overlap another scheme walk or a consumed authority span.
+        start = marker
+        while start > cursor and text[start - 1] in _SCHEME_CHARS:
+            start -= 1
+        while start < marker and text[start] not in _ASCII_LETTERS:
+            start += 1
+        if start == marker:
+            cursor = marker + 3
+            continue
+        end = marker + 3
+        last_at = -1
+        while end < length:
+            char = text[end]
+            if char.isspace() or char in '/?#<>"':
+                break
+            if char == '@':
+                last_at = end
+            end += 1
+        if last_at >= 0:
+            chunks.append(text[copied:marker + 3])
+            copied = last_at + 1
+        # Visit every marker, including one embedded in this authority.
+        # Authority scans stop at the next marker's first slash; backward
+        # scheme walks stop at the previous marker. Each span is read O(1)
+        # times, without treating RFC userinfo sub-delimiters as boundaries.
+        cursor = marker + 3
+    if not chunks:
+        return text
+    chunks.append(text[copied:])
+    return "".join(chunks)
+
+
 def _sanitize_error(text: str) -> str:
-    """Replace credential-like patterns with [REDACTED] before text reaches the LLM."""
-    return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
+    """Remove URL userinfo, then apply the unchanged credential matcher."""
+    return _CREDENTIAL_PATTERN.sub("[REDACTED]", _strip_url_userinfo(text))
 
 
 def _exc_str(exc: BaseException) -> str:
